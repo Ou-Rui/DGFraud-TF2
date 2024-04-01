@@ -194,113 +194,113 @@ class AttentionLayer(layers.Layer):
 
 
 class NodeAttention(layers.Layer):
-    """ Node level attention for SemiGNN.
+  """ Node level attention for SemiGNN. 
 
-    :param input_dim: the input dimension
-    :param view_num: the number of views
+  :param input_dim: the input dimension
+  :param view_num: the number of views
+  """
+
+  def __init__(self, input_dim: int,
+                **kwargs: Optional) -> None:
+    super().__init__(**kwargs)
+
+    self.H_v = tf.Variable(tf.random.normal([input_dim, 1], stddev=0.1))
+
+  def call(self, inputs: list, return_weights: bool = False) -> \
+          Union[tf.Tensor, Tuple[tf.Tensor, tf.Tensor]]:
+    """
+    Obtain attention value between nodes
+
+    :param inputs: the information passed to next layers
+    :param return_weights: the output whether return weights
     """
 
-    def __init__(self, input_dim: int,
-                 **kwargs: Optional) -> None:
-        super().__init__(**kwargs)
+    # convert adj to sparse tensor
+    emb, adj = inputs
+    zero = tf.constant(0, dtype=tf.float32)
+    where = tf.not_equal(adj, zero)
+    indices = tf.where(where)
+    values = tf.gather_nd(adj, indices)
+    adj = tf.SparseTensor(indices=indices,
+                          values=values,
+                          dense_shape=adj.shape)
+    v = tf.cast(adj, tf.float32) * tf.squeeze(
+        tf.tensordot(emb, self.H_v, axes=1))
 
-        self.H_v = tf.Variable(tf.random.normal([input_dim, 1], stddev=0.1))
+    alpha = tf.sparse.softmax(v)  # [nodes,nodes]
+    output = tf.sparse.sparse_dense_matmul(alpha, emb)    # [N, d]
 
-    def call(self, inputs: list, return_weights: bool = False) -> \
-            Union[tf.Tensor, Tuple[tf.Tensor, tf.Tensor]]:
-        """
-        Obtain attention value between nodes
-
-        :param inputs: the information passed to next layers
-        :param return_weights: the output whether return weights
-        """
-
-        # convert adj to sparse tensor
-        emb, adj = inputs
-        zero = tf.constant(0, dtype=tf.float32)
-        where = tf.not_equal(adj, zero)
-        indices = tf.where(where)
-        values = tf.gather_nd(adj, indices)
-        adj = tf.SparseTensor(indices=indices,
-                              values=values,
-                              dense_shape=adj.shape)
-        v = tf.cast(adj, tf.float32) * tf.squeeze(
-            tf.tensordot(emb, self.H_v, axes=1))
-
-        alpha = tf.sparse.softmax(v)  # [nodes,nodes]
-        output = tf.sparse.sparse_dense_matmul(alpha, emb)
-
-        if not return_weights:
-            return output
-        else:
-            return output, alpha
+    if not return_weights:
+      return output
+    else:
+      return output, alpha
 
 
 class ViewAttention(layers.Layer):
-    """ View level attention implementation for SemiGNN
+  """ View level attention implementation for SemiGNN
 
-        :param encoding: a list of MLP encoding sizes for each view
-        :param layer_size: the number of view attention layer
-        :param view_num: the number of views
+    :param encoding: a list of MLP encoding sizes for each view
+    :param layer_size: the number of view attention layer
+    :param view_num: the number of views
+  """
+
+  def __init__(self, encoding: list, layer_size: int,
+                view_num: int, **kwargs: Optional) -> None:
+    super().__init__(**kwargs)
+
+    self.encoding = encoding
+    self.view_num = view_num
+    self.layer_size = layer_size
+
+    # Eq. (2) in SemiGNN paper
+    self.dense_layers = []
+    for _ in range(view_num):
+      mlp = Sequential()
+      for l in range(layer_size):
+        mlp.add(tf.keras.layers.Dense(encoding[l], activation="relu"))
+      self.dense_layers.append(mlp)
+
+    self.phi = []
+    for _ in range(view_num):
+      self.phi.append(tf.Variable(tf.random.normal([encoding[-1], 1],
+                                                    stddev=0.1)))
+
+  def call(self, inputs: tf.Tensor, return_weights=False) -> \
+          Union[tf.Tensor, Tuple[tf.Tensor, tf.Tensor]]:
+    """
+    Obtain attention value between different views.
+    Eq. (3) and Eq. (4) in the paper
+
+    :param inputs: the information passed to next layers
+    :param return_weights: the output whether return weights
     """
 
-    def __init__(self, encoding: list, layer_size: int,
-                 view_num: int, **kwargs: Optional) -> None:
-        super().__init__(**kwargs)
+    h = []
+    h_phi = []
+    for v in range(self.view_num):
+      h_v = self.dense_layers[v](inputs[v])
+      h.append(h_v)
+      h_phi.append(tf.matmul(h_v, self.phi[v]))
 
-        self.encoding = encoding
-        self.view_num = view_num
-        self.layer_size = layer_size
+    h, h_phi = tf.concat(h, 0), tf.concat(h_phi, 0)
 
-        # Eq. (2) in SemiGNN paper
-        self.dense_layers = []
-        for _ in range(view_num):
-            mlp = Sequential()
-            for l in range(layer_size):
-                mlp.add(tf.keras.layers.Dense(encoding[l], activation="relu"))
-            self.dense_layers.append(mlp)
+    h = tf.reshape(h, [self.view_num, inputs[0].shape[0],
+                        self.encoding[-1]])
+    h_phi = tf.reshape(h_phi, [self.view_num, inputs[0].shape[0]])
 
-        self.phi = []
-        for _ in range(view_num):
-            self.phi.append(tf.Variable(tf.random.normal([encoding[-1], 1],
-                                                         stddev=0.1)))
+    alpha = tf.nn.softmax(h_phi, axis=0)
+    alpha = tf.expand_dims(alpha, axis=2)
+    alpha = tf.repeat(alpha, self.encoding[-1], axis=-1)
 
-    def call(self, inputs: tf.Tensor, return_weights=False) -> \
-            Union[tf.Tensor, Tuple[tf.Tensor, tf.Tensor]]:
-        """
-        Obtain attention value between different views.
-        Eq. (3) and Eq. (4) in the paper
+    # Eq. (4)
+    output = tf.reshape(alpha * h,
+                        [inputs[0].shape[0],
+                          self.encoding[-1] * self.view_num])
 
-        :param inputs: the information passed to next layers
-        :param return_weights: the output whether return weights
-        """
-
-        h = []
-        h_phi = []
-        for v in range(self.view_num):
-            h_v = self.dense_layers[v](inputs[v])
-            h.append(h_v)
-            h_phi.append(tf.matmul(h_v, self.phi[v]))
-
-        h, h_phi = tf.concat(h, 0), tf.concat(h_phi, 0)
-
-        h = tf.reshape(h, [self.view_num, inputs[0].shape[0],
-                           self.encoding[-1]])
-        h_phi = tf.reshape(h_phi, [self.view_num, inputs[0].shape[0]])
-
-        alpha = tf.nn.softmax(h_phi, axis=0)
-        alpha = tf.expand_dims(alpha, axis=2)
-        alpha = tf.repeat(alpha, self.encoding[-1], axis=-1)
-
-        # Eq. (4)
-        output = tf.reshape(alpha * h,
-                            [inputs[0].shape[0],
-                             self.encoding[-1] * self.view_num])
-
-        if not return_weights:
-            return output
-        else:
-            return output, alpha
+    if not return_weights:
+      return output
+    else:
+      return output, alpha
 
 
 def scaled_dot_product_attention(q: tf.Tensor, k: tf.Tensor,
